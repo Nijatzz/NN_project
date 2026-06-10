@@ -4,7 +4,6 @@ import pandas as pd
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from scipy.optimize import minimize_scalar
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LogisticRegression
@@ -27,7 +26,7 @@ PATIENCE   = 40
 VAL_FRAC   = 0.15
 SEEDS      = [0, 1, 2, 3, 4]
 
-# Task 2: feature group definitions (column indices into the 20-dim feature matrix)
+# Feature group definitions (column indices into the 20-dim feature matrix)
 FEATURE_GROUPS = {
     'DMM latents (A+B, 12d)':     list(range(0, 12)),   # fast means + log-stds
     'Emission residuals (C, 4d)':  list(range(12, 16)),  # actual - DMM emission_mu
@@ -355,18 +354,7 @@ def run_mt_arch(name, model_fn, loaders, lambda_rv=1.0, seeds=SEEDS):
     }
 
 
-# ── Task 1: Calibration helpers ────────────────────────────────────────────────
-
-def _logit(p):
-    p = np.clip(p, 1e-7, 1.0 - 1e-7)
-    return np.log(p / (1.0 - p))
-
-
-def _sigmoid(z):
-    return np.where(z >= 0,
-                    1.0 / (1.0 + np.exp(-z)),
-                    np.exp(z) / (1.0 + np.exp(z)))
-
+# ── Calibration helpers ────────────────────────────────────────────────────────
 
 def fit_platt(p_val, y_val):
     """Platt scaling on val only. NEVER pass test data."""
@@ -377,25 +365,6 @@ def fit_platt(p_val, y_val):
 
 def calibrate(p, scaler):
     return scaler.predict_proba(p.reshape(-1, 1))[:, 1].astype(np.float64)
-
-
-def fit_temperature(p_val, y_val):
-    """Temperature T via NLL minimization on val. NEVER pass test data."""
-    logits_val = _logit(p_val)
-    y = y_val.astype(float)
-
-    def nll(T):
-        T   = max(float(T), 1e-3)
-        p_c = np.clip(_sigmoid(logits_val / T), 1e-7, 1.0 - 1e-7)
-        return -np.mean(y * np.log(p_c) + (1.0 - y) * np.log(1.0 - p_c))
-
-    result = minimize_scalar(nll, bounds=(0.05, 10.0), method='bounded')
-    return float(result.x)
-
-
-def calibrate_temperature(p, T):
-    """p_cal = sigmoid(logit(p) / T). Strictly monotone => rank-preserving."""
-    return _sigmoid(_logit(p) / T).astype(np.float64)
 
 
 def compute_ece(p, y, n_bins=10):
@@ -414,181 +383,55 @@ def compute_ece(p, y, n_bins=10):
     return float(ece)
 
 
-# ── Backtest helpers ──────────────────────────────────────────────────────────
+# ── Calibration plot ───────────────────────────────────────────────────────────
 
-def backtest_short_vol(data, p_te, test_anchors, threshold,
-                       horizon=10, vrp_capture_pct=0.30,
-                       transaction_cost_bps=2.0):
-    vix_pct  = data['vix_pct_te']
-    rs_minus = np.minimum(data['log_ret_te'], 0.0) ** 2
-    med_tr, jump_tr = data['vrp_threshold_constants']
-    rets, dates = [], []
-    for i, t in enumerate(test_anchors):
-        if t + horizon >= len(rs_minus):
-            break
-        if p_te[i] <= threshold:
-            rets.append(0.0); dates.append(data['dates_te'][t]); continue
-        future_max = rs_minus[t + 1: t + 1 + horizon].max()
-        spike      = (future_max - med_tr) > jump_tr
-        vix_level  = vix_pct[t] / 100.0
-        pnl = (-4.0 * vix_level * vrp_capture_pct) if spike else (vix_level * vrp_capture_pct)
-        pnl -= transaction_cost_bps / 10000.0
-        rets.append(pnl); dates.append(data['dates_te'][t])
-    return pd.Series(rets, index=pd.DatetimeIndex(dates))
-
-
-def backtest_buy_hold(data, test_anchors, horizon=10):
-    rets, dates = [], []
-    for t in test_anchors:
-        if t + horizon >= len(data['log_ret_te']): break
-        rets.append(float(data['log_ret_te'][t + 1: t + 1 + horizon].sum()))
-        dates.append(data['dates_te'][t])
-    return pd.Series(rets, index=pd.DatetimeIndex(dates))
-
-
-def sharpe(ret_series, periods_per_year=25):
-    r = ret_series.dropna()
-    if r.std() == 0 or len(r) < 2: return 0.0
-    return float((r.mean() / r.std()) * np.sqrt(periods_per_year))
-
-
-# ── Task 1 follow-up: rank-preservation verification ─────────────────────────
-
-def verify_temp_rank_preservation(data, res_gru):
-    """
-    Temperature scaling is p_cal = sigmoid(logit(p_raw)/T), which is strictly
-    monotone in p_raw => it cannot change ranks.
-
-    Proof: d/dp_raw [sigmoid(logit(p_raw)/T)] > 0 for all T > 0.
-
-    Empirical verification:
-      1. Find the raw threshold tau_raw that selects the SAME 56 windows as
-         temperature-calibrated tau=0.70 (from prior run).
-      2. Run backtest at tau_raw on RAW predictions.
-      3. Check Sharpe matches temp tau=0.70 Sharpe to floating-point precision.
-    """
-    print('\n=== Task 1 follow-up: Temperature Scaling Rank-Preservation Check ===')
-
-    p_raw    = res_gru['p_te_ensemble']
-    p_val    = res_gru['p_va_ensemble']
-    y_val    = res_gru['y_va']
-    anchors  = res_gru['test_anchors']
-
-    # Re-fit temperature on val (same as before)
-    T_opt  = fit_temperature(p_val, y_val)
-    p_temp = calibrate_temperature(p_raw, T_opt)
-
-    TAU_TEMP = 0.70
-    n_temp_active = int((p_temp > TAU_TEMP).sum())
-
-    # Find tau_raw that selects exactly n_temp_active windows from raw predictions.
-    # Sort raw predictions descending; the threshold is just below the
-    # (n_temp_active)-th largest value.
-    p_sorted_desc = np.sort(p_raw)[::-1]
-    if n_temp_active == 0:
-        print('  No windows selected at temp tau=0.70; cannot verify.')
-        return
-    if n_temp_active >= len(p_sorted_desc):
-        tau_raw = 0.0
-    else:
-        # threshold = midpoint between the n_temp_active-th and (n_temp_active+1)-th
-        # largest values, to get exactly n_temp_active windows strictly above it
-        tau_raw = float((p_sorted_desc[n_temp_active - 1] +
-                         p_sorted_desc[n_temp_active]) / 2.0)
-
-    n_raw_active = int((p_raw > tau_raw).sum())
-
-    # Backtests
-    pnl_temp = backtest_short_vol(data, p_temp, anchors, threshold=TAU_TEMP)
-    pnl_raw  = backtest_short_vol(data, p_raw,  anchors, threshold=tau_raw)
-
-    sr_temp  = sharpe(pnl_temp)
-    sr_raw   = sharpe(pnl_raw)
-
-    print(f'  Temperature tau=0.70 : n_trades={n_temp_active:3d}  Sharpe={sr_temp:.6f}')
-    print(f'  Equivalent raw tau   : tau_raw={tau_raw:.6f}  n_trades={n_raw_active:3d}  '
-          f'Sharpe={sr_raw:.6f}')
-
-    sharpe_diff = abs(sr_temp - sr_raw)
-    if sharpe_diff < 1e-9:
-        print(f'  RANK-PRESERVATION CONFIRMED: Sharpe diff = {sharpe_diff:.2e}  (identical)')
-    elif sharpe_diff < 1e-6:
-        print(f'  RANK-PRESERVATION CONFIRMED: Sharpe diff = {sharpe_diff:.2e}  '
-              f'(floating-point noise only)')
-    else:
-        print(f'  WARNING: Sharpe diff = {sharpe_diff:.6f}  '
-              f'-- investigate temperature scaling implementation!')
-        print(f'    temp n active via p_temp > {TAU_TEMP}: {n_temp_active}')
-        print(f'    raw  n active via p_raw  > {tau_raw:.6f}: {n_raw_active}')
-        # Check if the same trades were triggered
-        temp_mask = p_temp > TAU_TEMP
-        raw_mask  = p_raw  > tau_raw
-        print(f'    Overlap: {(temp_mask & raw_mask).sum()} / {n_temp_active} windows identical')
-
-    print(f'\n  REPORT: tau_raw={tau_raw:.6f}  n_trades={n_raw_active}  '
-          f'Sharpe={sr_raw:.4f}  (temp tau=0.70 Sharpe={sr_temp:.4f})')
-    return tau_raw, n_raw_active, sr_raw, sr_temp
-
-
-# ── Task 1 Plots ──────────────────────────────────────────────────────────────
-
-def plot_calibration_before_after(results_gru, results_cnn,
+def plot_calibration_before_after(results_gru,
                                   save_path='vrp_calibration_before_after.png'):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=(8, 6))
     fig.suptitle('Probability Calibration -- Before vs After Platt Scaling  (test set)',
                  fontsize=14, fontweight='bold')
-    pairs = [(results_gru, 'GRU', axes[0]), (results_cnn, 'CNN', axes[1])]
 
-    for res, arch, ax in pairs:
-        y_te    = res['y_te']
-        p_raw   = res['p_te_ensemble']
-        p_platt = res['p_te_platt']
-        p_temp  = res['p_te_temp']
+    res     = results_gru
+    y_te    = res['y_te']
+    p_raw   = res['p_te_ensemble']
+    p_platt = res['p_te_platt']
 
-        ax.plot([0, 1], [0, 1], 'k--', lw=1.5, label='Perfect calibration', zorder=1)
+    ax.plot([0, 1], [0, 1], 'k--', lw=1.5, label='Perfect calibration', zorder=1)
 
+    try:
+        fr, mr = calibration_curve(y_te, p_raw, n_bins=10, strategy='quantile')
+        ax.plot(mr, fr, 'o-', color='#e74c3c', lw=2, ms=6,
+                label=f'Raw (ECE={res["ece_raw"]:.4f})', zorder=3)
+    except Exception:
+        pass
+
+    p_uniq = np.unique(np.round(p_platt, 3))
+    if len(p_uniq) <= 2:
+        cm = p_platt.mean()
+        ax.scatter([cm], [y_te.mean()], s=180, marker='s', color='#2ecc71', zorder=5,
+                   label=f'Platt (ECE={res["ece_platt"]:.4f}, degenerate: p->{cm:.3f})')
+        ax.annotate('Platt\n(constant)', xy=(cm, y_te.mean()),
+                    xytext=(cm - 0.18, y_te.mean() - 0.08), fontsize=8,
+                    color='#2ecc71', arrowprops=dict(arrowstyle='->', color='#2ecc71'))
+    else:
         try:
-            fr, mr = calibration_curve(y_te, p_raw, n_bins=10, strategy='quantile')
-            ax.plot(mr, fr, 'o-', color='#e74c3c', lw=2, ms=6,
-                    label=f'Raw (ECE={res["ece_raw"]:.4f})', zorder=3)
+            fp, mp = calibration_curve(y_te, p_platt, n_bins=10, strategy='quantile')
+            ax.plot(mp, fp, 's-', color='#2ecc71', lw=2, ms=6,
+                    label=f'Platt (ECE={res["ece_platt"]:.4f})', zorder=4)
         except Exception:
             pass
 
-        p_uniq = np.unique(np.round(p_platt, 3))
-        if len(p_uniq) <= 2:
-            cm = p_platt.mean()
-            ax.scatter([cm], [y_te.mean()], s=180, marker='s', color='#2ecc71', zorder=5,
-                       label=f'Platt (ECE={res["ece_platt"]:.4f}, degenerate: p->{cm:.3f})')
-            ax.annotate('Platt\n(constant)', xy=(cm, y_te.mean()),
-                        xytext=(cm - 0.18, y_te.mean() - 0.08), fontsize=8,
-                        color='#2ecc71', arrowprops=dict(arrowstyle='->', color='#2ecc71'))
-        else:
-            try:
-                fp, mp = calibration_curve(y_te, p_platt, n_bins=10, strategy='quantile')
-                ax.plot(mp, fp, 's-', color='#2ecc71', lw=2, ms=6,
-                        label=f'Platt (ECE={res["ece_platt"]:.4f})', zorder=4)
-            except Exception:
-                pass
+    ax.set_xlabel('Mean Predicted Probability', fontsize=12)
+    ax.set_ylabel('Fraction of Positives', fontsize=12)
+    ax.set_title('GRU: Calibration Curve', fontsize=13)
+    ax.legend(fontsize=8.5, loc='upper left')
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
 
-        try:
-            ft, mt = calibration_curve(y_te, p_temp, n_bins=10, strategy='quantile')
-            ax.plot(mt, ft, '^--', color='#9b59b6', lw=1.5, ms=5, alpha=0.75, zorder=2,
-                    label=f'Temp. scaling (ECE={res["ece_temp"]:.4f})')
-        except Exception:
-            pass
-
-        ax.set_xlabel('Mean Predicted Probability', fontsize=12)
-        ax.set_ylabel('Fraction of Positives', fontsize=12)
-        ax.set_title(f'{arch}: Calibration Curve', fontsize=13)
-        ax.legend(fontsize=8.5, loc='upper left')
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-        ax.grid(True, alpha=0.3)
-
-        ax2 = ax.twinx()
-        ax2.hist(p_raw,  bins=25, alpha=0.12, color='#e74c3c')
-        ax2.hist(p_temp, bins=25, alpha=0.12, color='#9b59b6')
-        ax2.set_ylabel('Count', fontsize=8, color='gray')
-        ax2.tick_params(axis='y', labelcolor='gray', labelsize=7)
+    ax2 = ax.twinx()
+    ax2.hist(p_raw, bins=25, alpha=0.12, color='#e74c3c')
+    ax2.set_ylabel('Count', fontsize=8, color='gray')
+    ax2.tick_params(axis='y', labelcolor='gray', labelsize=7)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -596,97 +439,7 @@ def plot_calibration_before_after(results_gru, results_cnn,
     print(f'  Saved: {save_path}')
 
 
-def plot_threshold_sweep_calibrated(results_gru, results_cnn,
-                                    save_path='vrp_threshold_sweep_calibrated.png'):
-    thresholds = np.linspace(0.3, 0.99, 60)
-    fig, axes  = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('Threshold Sweep: Raw vs Calibrated Probabilities',
-                 fontsize=14, fontweight='bold')
-    pairs = [(results_gru, 'GRU', axes[0]), (results_cnn, 'CNN', axes[1])]
-
-    for res, arch, (ax_prec, ax_cov) in pairs:
-        y_te    = res['y_te']
-        p_raw   = res['p_te_ensemble']
-        p_platt = res['p_te_platt']
-        p_temp  = res['p_te_temp']
-
-        def sweep(p):
-            pl, nl = [], []
-            for tau in thresholds:
-                mask = p > tau
-                nl.append(int(mask.sum()))
-                pl.append(float(y_te[mask].mean()) if mask.sum() > 0 else np.nan)
-            return np.array(pl), np.array(nl)
-
-        prec_r, n_r = sweep(p_raw)
-        prec_p, n_p = sweep(p_platt)
-        prec_t, n_t = sweep(p_temp)
-
-        ax_prec.plot(thresholds, prec_r, 'o-', color='#e74c3c', lw=2, ms=3, label='Raw')
-        ax_prec.plot(thresholds, prec_p, 's-', color='#2ecc71', lw=2, ms=3, label='Platt')
-        ax_prec.plot(thresholds, prec_t, '^--', color='#9b59b6', lw=1.5, ms=3,
-                     label='Temp. scaling')
-        ax_prec.axhline(y_te.mean(), color='gray', ls=':', lw=1.2,
-                        label=f'Base rate {y_te.mean():.3f}')
-        ax_prec.set_xlabel('Threshold tau', fontsize=11)
-        ax_prec.set_ylabel('Precision (fraction positive)', fontsize=11)
-        ax_prec.set_title(f'{arch}: Precision vs tau', fontsize=12)
-        ax_prec.legend(fontsize=9); ax_prec.set_ylim(0.5, 1.02); ax_prec.grid(True, alpha=0.3)
-
-        ax_cov.plot(thresholds, n_r, 'o-', color='#e74c3c', lw=2, ms=3, label='Raw')
-        ax_cov.plot(thresholds, n_p, 's-', color='#2ecc71', lw=2, ms=3, label='Platt')
-        ax_cov.plot(thresholds, n_t, '^--', color='#9b59b6', lw=1.5, ms=3,
-                    label='Temp. scaling')
-        ax_cov.set_xlabel('Threshold tau', fontsize=11)
-        ax_cov.set_ylabel('N windows above tau', fontsize=11)
-        ax_cov.set_title(f'{arch}: Coverage vs tau', fontsize=12)
-        ax_cov.legend(fontsize=9); ax_cov.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f'  Saved: {save_path}')
-
-
-def plot_backtest_calibrated(data, results_gru, results_cnn,
-                             save_path='vrp_backtest_calibrated.png'):
-    bh     = backtest_buy_hold(data, results_gru['test_anchors'])
-    bh_cum = bh.cumsum()
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    fig.suptitle('Backtest: Short-Vol Strategy  (tau=0.5, raw vs calibrated)',
-                 fontsize=14, fontweight='bold')
-    pairs = [(results_gru, 'GRU', axes[0]), (results_cnn, 'CNN', axes[1])]
-
-    for res, arch, ax in pairs:
-        p_raw   = res['p_te_ensemble']
-        p_platt = res['p_te_platt']
-        p_temp  = res['p_te_temp']
-        anchors = res['test_anchors']
-        pnl_raw   = backtest_short_vol(data, p_raw,   anchors, threshold=0.5)
-        pnl_platt = backtest_short_vol(data, p_platt, anchors, threshold=0.5)
-        pnl_temp  = backtest_short_vol(data, p_temp,  anchors, threshold=0.5)
-
-        ax.plot(bh_cum.index, bh_cum.values, color='gray', lw=1.5, ls='--',
-                label=f'Buy & hold  Sharpe={sharpe(bh):.2f}')
-        ax.plot(pnl_raw.index, pnl_raw.cumsum().values, color='#e74c3c', lw=2,
-                label=f'Raw         Sharpe={sharpe(pnl_raw):.2f}  n={(pnl_raw!=0).sum()}')
-        ax.plot(pnl_platt.index, pnl_platt.cumsum().values, color='#2ecc71', lw=2,
-                label=f'Platt       Sharpe={sharpe(pnl_platt):.2f}  '
-                      f'n={(pnl_platt!=0).sum()} (all windows)')
-        ax.plot(pnl_temp.index, pnl_temp.cumsum().values, color='#9b59b6', lw=2, ls='--',
-                label=f'Temp. cal   Sharpe={sharpe(pnl_temp):.2f}  n={(pnl_temp!=0).sum()}')
-        ax.axhline(0, color='black', lw=0.8, ls=':')
-        ax.set_title(f'{arch}: Cumulative Log Return (tau=0.5)', fontsize=13)
-        ax.set_xlabel('Date', fontsize=11); ax.set_ylabel('Cumulative PnL (log return)', fontsize=11)
-        ax.legend(fontsize=8.5); ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f'  Saved: {save_path}')
-
-
-# ── Task 2: Feature Ablation ──────────────────────────────────────────────────
+# ── Feature Ablation ───────────────────────────────────────────────────────────
 
 def run_feature_ablation(data, seeds=SEEDS):
     """Train VRPGRU on each of 4 feature subsets, same config as full baseline.
@@ -695,7 +448,7 @@ def run_feature_ablation(data, seeds=SEEDS):
     Groups defined in FEATURE_GROUPS at top of file.
     """
     print('\n' + '='*70)
-    print('=== Task 2: Feature Group Ablation (VRPGRU only) ===')
+    print('=== Feature Group Ablation (VRPGRU only) ===')
     print('=== 4 variants x 5 seeds = 20 total training runs  ===')
     print('='*70)
 
@@ -826,7 +579,7 @@ def plot_feature_ablation(ablation_results,
 def print_ablation_table(ablation_results):
     """Print summary table matching handoff format."""
     print('\n' + '='*80)
-    print('=== Task 2: Feature Ablation Summary Table ===')
+    print('=== Feature Ablation Summary Table ===')
     print(f'  {"Group":<30}  {"Dims":>4}  {"AUC mean":>9}  {"AUC std":>8}  '
           f'{"AP mean":>8}  {"AP std":>7}  {"Ens AUC":>8}  {"Ens ECE":>8}')
     print('  ' + '-'*78)
@@ -967,7 +720,7 @@ def main():
     mt_train_ds, mt_val_ds, mt_test_ds = mt_loaders[3], mt_loaders[4], mt_loaders[5]
     print(f'  MT train windows: {len(mt_train_ds)}  val: {len(mt_val_ds)}  test: {len(mt_test_ds)}')
 
-    # ── Baseline: full 20-dim GRU + CNN (Task 1 context) ─────────────────────
+    # ── Baseline: full 20-dim GRU ────────────────────────────────────────────
     results = {}
     results['GRU'] = run_arch('VRPGRU', lambda: VRPGRU(input_dim=20), loaders)
     
@@ -1005,24 +758,10 @@ def main():
     # Scatter plot for best lambda (lowest RMSE)
     best_res = min(mt_results, key=lambda x: x['real_rmse'])
     best_pred_log_vol = best_res['mu_te_ensemble'] * data['sig_rv'] + data['mu_rv']
-    plot_rv_scatter(y_rv_te_actual, best_pred_log_vol, best_res['real_rmse'], best_res['real_r2'], 
+    plot_rv_scatter(y_rv_te_actual, best_pred_log_vol, best_res['real_rmse'], best_res['real_r2'],
                     title_prefix=f"MT (lam={best_res['lambda_rv']})", save_path='vrp_rv_scatter.png')
-    
-    # ── Task 1 calibration (COMMENTED OUT to save time -- re-enable as needed)
 
-    print('\n=== Backtest -- RAW predictions ===')
-    bh = backtest_buy_hold(data, results['GRU']['test_anchors'])
-    print(f'  Buy & hold SPY  Sharpe={sharpe(bh):.2f}  cum={bh.sum():+.3f}')
-    for arch in ['GRU']:
-        for tau in [0.5, 0.6]:
-            pnl = backtest_short_vol(data, results[arch]['p_te_ensemble'],
-                                     results[arch]['test_anchors'], threshold=tau)
-            print(f'  {arch}  tau={tau:.2f}: n_trades={(pnl!=0).sum():3d}  '
-                  f'Sharpe={sharpe(pnl):.2f}  cum={pnl.sum():+.3f}')
-
-    # ── Task 1 calibration (COMMENTED OUT to save time -- re-enable as needed)
-    # To re-enable: uncomment the block below and the plot calls.
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Calibration: Platt scaling + ECE (documented negative result) ─────────
     for arch in ['GRU']:
         res   = results[arch]
         p_val = res['p_va_ensemble']
@@ -1032,44 +771,29 @@ def main():
 
         platt_scaler       = fit_platt(p_val, y_val)
         res['p_te_platt']  = calibrate(p_raw, platt_scaler)
-        T_opt              = fit_temperature(p_val, y_val)
-        res['p_te_temp']   = calibrate_temperature(p_raw, T_opt)
-        res['ece_raw']     = compute_ece(p_raw,               y_te, n_bins=10)
-        res['ece_platt']   = compute_ece(res['p_te_platt'],   y_te, n_bins=10)
-        res['ece_temp']    = compute_ece(res['p_te_temp'],     y_te, n_bins=10)
-        res['T_opt']       = T_opt
+        res['ece_raw']     = compute_ece(p_raw,             y_te, n_bins=10)
+        res['ece_platt']   = compute_ece(res['p_te_platt'], y_te, n_bins=10)
         res['platt_coef']  = platt_scaler.coef_[0][0]
 
-    print('\n=== ECE Summary (Task 1, 10 quantile bins, test set) ===')
-    print(f'  {"":6s}  {"Before":>10}  {"After Platt":>12}  {"After Temp":>11}')
+    print('\n=== ECE Summary (10 quantile bins, test set) ===')
+    print(f'  {"":6s}  {"Before":>10}  {"After Platt":>12}')
     for arch in ['GRU']:
         print(f'  {arch:<6}  {results[arch]["ece_raw"]:>10.4f}  '
-              f'{results[arch]["ece_platt"]:>12.4f}  '
-              f'{results[arch]["ece_temp"]:>11.4f}')
+              f'{results[arch]["ece_platt"]:>12.4f}')
 
-    # ── Task 1 follow-up: rank-preservation verification ─────────────────────
-    verify_temp_rank_preservation(data, results['GRU'])
+    plot_calibration_before_after(results['GRU'])
 
-    # ── Task 1 plots (kept intact, not re-run unless needed) ──────────────────
-    # plot_calibration_before_after(results['GRU'], results['CNN'])
-    # plot_threshold_sweep_calibrated(results['GRU'], results['CNN'])
-    # plot_backtest_calibrated(data, results['GRU'], results['CNN'])
-
-    # ── Task 2: Feature group ablation ────────────────────────────────────────
+    # ── Feature group ablation ────────────────────────────────────────────────
     ablation_results = run_feature_ablation(data, seeds=SEEDS)
     print_ablation_table(ablation_results)
 
-    print('\n=== Generating Task 2 plot ===')
+    print('\n=== Generating ablation plot ===')
     plot_feature_ablation(ablation_results, save_path='vrp_feature_ablation.png')
 
     # ── Save ──────────────────────────────────────────────────────────────────
     np.savez('vrp_pipeline_results.npz',
              gru_p_te       = results['GRU']['p_te_ensemble'],
-             cnn_p_te       = results['CNN']['p_te_ensemble'],
              gru_p_te_platt = results['GRU']['p_te_platt'],
-             cnn_p_te_platt = results['CNN']['p_te_platt'],
-             gru_p_te_temp  = results['GRU']['p_te_temp'],
-             cnn_p_te_temp  = results['CNN']['p_te_temp'],
              y_te           = results['GRU']['y_te'],
              test_anchors   = results['GRU']['test_anchors'])
     print('Saved vrp_pipeline_results.npz')

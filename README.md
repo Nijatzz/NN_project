@@ -39,7 +39,7 @@ vs R²=0.238 for a persistence baseline.
 ## How to reproduce
 
 ```bash
-pip install torch scikit-learn pandas numpy matplotlib scipy
+pip install torch scikit-learn pandas numpy matplotlib
 python vrp_pipeline.py
 ```
 
@@ -56,11 +56,23 @@ Runs in ~5 minutes on CPU. Regenerates all plots and prints all results.
 | `fetch_data.py` | Data download helpers |
 | `vrp_signals.py` | Part 2: model architectures + dataset + loss |
 | `vrp_features.py` | Part 2: feature engineering pipeline |
-| `vrp_pipeline.py` | Part 2: training, evaluation, backtest |
+| `vrp_pipeline.py` | Part 2: training, calibration, multi-task, evaluation |
 | `gru_signals.py` | Initial two-head signal model (collaborator) |
 | `handoff.md` | Project state and task documentation |
 | `*.csv / *.xlsx` | Raw market and macro data |
 | `*.png` | Generated evaluation plots |
+
+## Notes
+
+- The toy short-vol **backtest was removed**: VRP is harvested through options, so a
+  spot-only short-vol PnL cannot even approximately measure how much the signal network
+  helps. Signal-level metrics (AUC / AP / precision-at-threshold) are the relevant
+  evaluation for this representation-learning question — prediction quality is not a
+  tradeable strategy.
+- **Temperature scaling was removed** from the calibration analysis: it is rank-preserving
+  (a monotone reparametrisation), so it cannot change any threshold-based decision and
+  produced results indistinguishable from raw. Platt scaling + ECE are kept as the
+  documented (negative) calibration result.
 
 ## Authors
 

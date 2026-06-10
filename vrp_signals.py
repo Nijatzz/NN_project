@@ -1,10 +1,10 @@
 """
 vrp_signals.py
-VRP-only signal pipeline (MR head dropped per Part-1 author's call).
+VRP-only signal pipeline (the mean-reversion head was dropped as it did not work).
 
 Two trunk variants share a common interface:
-  - VRPGRU : 2-layer GRU  (the original architecture from gru_signals.py)
-  - VRPCNN : 2-layer dilated 1D-CNN  (added for the architecture comparison)
+  - VRPGRU : 2-layer GRU
+  - VRPCNN : 2-layer dilated 1D-CNN (for the architecture comparison)
 
 Both consume (B, W, input_dim) windows and emit p_vrp in (0, 1) per window
 using the same VRP head, so they are drop-in interchangeable.
@@ -91,7 +91,7 @@ class _VRPHead(nn.Module):
 
 
 class VRPGRU(nn.Module):
-    """2-layer GRU trunk. Friend's original — kept hidden sizes <=8 per his note."""
+    """2-layer GRU trunk. Hidden sizes kept <=8 to avoid overfitting the small window count."""
     def __init__(self, input_dim=20, hidden1=8, hidden2=4, head_hidden=8, dropout=0.2):
         super().__init__()
         self.gru1 = nn.GRU(input_dim, hidden1, batch_first=True)

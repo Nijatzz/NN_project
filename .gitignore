@@ -18,3 +18,6 @@ Thumbs.db
 vrp_pipeline_results.npz
 vrp_pipeline_executed.ipynb
 quick_task.py
+# Stats analysis transient log (results.json + npz are kept)
+stats/run.log
+stats/rv_run.log
